@@ -13,6 +13,7 @@ export const PanelModelSchema = z.union([
   z.object({
     model: z.string().describe("OpenCode provider/model reference or raw model ID"),
     weight: z.number().default(1),
+    maxContext: z.number().optional().describe("Max context tokens this model supports. Used for selective routing."),
     provider: z.string().optional(),
     apiKey: z.string().optional(),
     baseURL: z.string().optional(),
@@ -40,6 +41,13 @@ export const RoutingPolicySchema = z.object({
 
 export type RoutingPolicy = z.infer<typeof RoutingPolicySchema>;
 
+export const ContextLimitsSchema = z.object({
+  default: z.number().default(128000).describe("Default context limit for panels without explicit maxContext"),
+  skipThreshold: z.number().default(256000).describe("Input token count above which short-context panels are skipped entirely"),
+});
+
+export type ContextLimits = z.infer<typeof ContextLimitsSchema>;
+
 export const FusionConfigSchema = z.object({
   panel: z.array(PanelModelSchema).min(2),
   judge: JudgeModelSchema,
@@ -47,6 +55,7 @@ export const FusionConfigSchema = z.object({
   routing: RoutingPolicySchema.default({}),
   timeout: z.number().default(120000),
   judgeSystemPrompt: z.string().optional(),
+  contextLimits: ContextLimitsSchema.default({}),
 });
 
 export type FusionConfig = z.infer<typeof FusionConfigSchema>;

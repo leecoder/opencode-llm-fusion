@@ -7,6 +7,7 @@ import { generateText } from "ai";
 import type { FusionConfig, PanelModel, JudgeModel, SynthesisStrategy } from "./config.js";
 import { DEFAULT_JUDGE_SYSTEM_PROMPT } from "./config.js";
 import { createProviderModel } from "./providers.js";
+import { routePanels, getRoutingSummary, type PanelAssignment, type PanelContextMode } from "./panel-router.js";
 
 export interface FusionUsage {
   panelTokens: { model: string; promptTokens: number; completionTokens: number }[];
@@ -20,6 +21,7 @@ interface PanelResponse {
   text: string;
   usage: { promptTokens: number; completionTokens: number };
   finishReason: string;
+  contextMode: PanelContextMode;
 }
 
 export function createFusionLanguageModel(config: FusionConfig): LanguageModelV3 {
@@ -52,6 +54,7 @@ export function createFusionLanguageModel(config: FusionConfig): LanguageModelV3
             panelResponses: panelResponses.map((r) => ({
               model: r.model,
               text: r.text,
+              contextMode: r.contextMode,
             })),
             strategy: config.strategy,
           },
@@ -111,15 +114,28 @@ export function createFusionLanguageModel(config: FusionConfig): LanguageModelV3
   };
 }
 
+function getModelLabel(panelModel: PanelModel): string {
+  if (typeof panelModel === "string") return panelModel;
+  return panelModel.model;
+}
+
 async function queryPanel(
   config: FusionConfig,
   options: LanguageModelV3CallOptions
 ): Promise<PanelResponse[]> {
   const timeout = config.timeout;
+  const allMessages = convertPromptToMessages(options.prompt);
+  const assignments = routePanels(config, allMessages);
 
-  const panelPromises = config.panel.map(async (panelModel): Promise<PanelResponse> => {
-    const model = createProviderModel(panelModel);
-    const promptMessages = convertPromptToMessages(options.prompt);
+  const activeAssignments = assignments.filter((a) => a.mode !== "skip");
+
+  if (activeAssignments.length === 0) {
+    throw new Error("[opencode-llm-fusion] All panels were skipped. Input too large for any configured panel model.");
+  }
+
+  const panelPromises = activeAssignments.map(async (assignment): Promise<PanelResponse> => {
+    const model = createProviderModel(assignment.panelModel);
+    const promptMessages = assignment.messages;
 
     try {
       const systemMessages = promptMessages.filter((m) => m.role === "system");
@@ -134,20 +150,22 @@ async function queryPanel(
       });
 
       return {
-        model: `${panelModel.provider}/${panelModel.model}`,
+        model: getModelLabel(assignment.panelModel),
         text: result.text,
         usage: {
           promptTokens: result.usage.inputTokens ?? 0,
           completionTokens: result.usage.outputTokens ?? 0,
         },
         finishReason: result.finishReason,
+        contextMode: assignment.mode,
       };
     } catch (error) {
       return {
-        model: `${panelModel.provider}/${panelModel.model}`,
+        model: getModelLabel(assignment.panelModel),
         text: `[ERROR: Model failed - ${error instanceof Error ? error.message : "unknown error"}]`,
         usage: { promptTokens: 0, completionTokens: 0 },
         finishReason: "error",
+        contextMode: assignment.mode,
       };
     }
   });
@@ -195,12 +213,32 @@ async function synthesize(
   }
 }
 
+function buildContextCoverageNote(panelResponses: PanelResponse[]): string {
+  const hasCompact = panelResponses.some((r) => r.contextMode === "compact");
+  if (!hasCompact) return "";
+
+  const lines = [
+    "\n\nIMPORTANT - Context Coverage:",
+    "Not all models received identical context. When models disagree on specifics, prefer responses from models that received FULL context:",
+  ];
+  for (const r of panelResponses) {
+    if (r.contextMode === "full") {
+      lines.push(`  - ${r.model}: FULL context (more reliable for specific details)`);
+    } else {
+      lines.push(`  - ${r.model}: COMPACTED context (may miss details from older messages)`);
+    }
+  }
+  return lines.join("\n");
+}
+
 async function singleJudge(
   config: FusionConfig,
   panelResponses: PanelResponse[]
 ): Promise<{ text: string; usage: FusionUsage }> {
   const judgeModel = createProviderModel(config.judge);
-  const systemPrompt = config.judgeSystemPrompt ?? DEFAULT_JUDGE_SYSTEM_PROMPT;
+  const baseSystemPrompt = config.judgeSystemPrompt ?? DEFAULT_JUDGE_SYSTEM_PROMPT;
+  const coverageNote = buildContextCoverageNote(panelResponses);
+  const systemPrompt = baseSystemPrompt + coverageNote;
 
   const responsesBlock = panelResponses
     .map((r, i) => `--- Response ${i + 1} (${r.model}) ---\n${r.text}`)
@@ -240,6 +278,7 @@ async function majorityVote(
   panelResponses: PanelResponse[]
 ): Promise<{ text: string; usage: FusionUsage }> {
   const judgeModel = createProviderModel(config.judge);
+  const coverageNote = buildContextCoverageNote(panelResponses);
 
   const responsesBlock = panelResponses
     .map((r, i) => `--- Response ${i + 1} (${r.model}) ---\n${r.text}`)
@@ -249,7 +288,7 @@ async function majorityVote(
     model: judgeModel,
     system: `You are a voting judge. You receive multiple responses to the same prompt.
 Pick the BEST response. Output ONLY the number of the best response (e.g. "1", "2", "3").
-Consider: correctness, completeness, clarity, and relevance.`,
+Consider: correctness, completeness, clarity, and relevance.${coverageNote}`,
     prompt: `Which response is best?\n\n${responsesBlock}`,
   });
 
@@ -288,6 +327,7 @@ async function bestOfN(
   panelResponses: PanelResponse[]
 ): Promise<{ text: string; usage: FusionUsage }> {
   const judgeModel = createProviderModel(config.judge);
+  const coverageNote = buildContextCoverageNote(panelResponses);
 
   const responsesBlock = panelResponses
     .map((r, i) => `--- Response ${i + 1} (${r.model}) ---\n${r.text}`)
@@ -297,7 +337,7 @@ async function bestOfN(
     model: judgeModel,
     system: `You are a scoring judge. You receive multiple responses to the same prompt.
 Score each response from 1-10 on: correctness, completeness, clarity.
-Output ONLY a JSON array of scores, e.g. [8, 7, 9]. One score per response, in order.`,
+Output ONLY a JSON array of scores, e.g. [8, 7, 9]. One score per response, in order.${coverageNote}`,
     prompt: `Score these responses:\n\n${responsesBlock}`,
   });
 
@@ -309,8 +349,10 @@ Output ONLY a JSON array of scores, e.g. [8, 7, 9]. One score per response, in o
   }
 
   const weightedScores = scores.map((score, i) => {
-    const weight = config.panel[i]?.weight ?? 1;
-    return score * weight;
+    const panel = config.panel[i];
+    const weight = (typeof panel !== "string" && panel?.weight) ? panel.weight : 1;
+    const contextBoost = panelResponses[i]?.contextMode === "full" ? 1.1 : 1.0;
+    return score * weight * contextBoost;
   });
 
   const bestIndex = weightedScores.indexOf(Math.max(...weightedScores));

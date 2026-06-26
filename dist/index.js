@@ -24215,6 +24215,7 @@ var PanelModelSchema = z.union([
   z.object({
     model: z.string().describe("OpenCode provider/model reference or raw model ID"),
     weight: z.number().default(1),
+    maxContext: z.number().optional().describe("Max context tokens this model supports. Used for selective routing."),
     provider: z.string().optional(),
     apiKey: z.string().optional(),
     baseURL: z.string().optional()
@@ -24233,13 +24234,18 @@ var RoutingPolicySchema = z.object({
   mode: z.enum(["always", "manual", "auto"]).default("always"),
   complexityThreshold: z.number().min(0).max(1).default(0.7)
 });
+var ContextLimitsSchema = z.object({
+  default: z.number().default(128e3).describe("Default context limit for panels without explicit maxContext"),
+  skipThreshold: z.number().default(256e3).describe("Input token count above which short-context panels are skipped entirely")
+});
 var FusionConfigSchema = z.object({
   panel: z.array(PanelModelSchema).min(2),
   judge: JudgeModelSchema,
   strategy: SynthesisStrategySchema.default("single_judge"),
   routing: RoutingPolicySchema.default({}),
   timeout: z.number().default(12e4),
-  judgeSystemPrompt: z.string().optional()
+  judgeSystemPrompt: z.string().optional(),
+  contextLimits: ContextLimitsSchema.default({})
 });
 var DEFAULT_JUDGE_SYSTEM_PROMPT = `You are a synthesis judge. You receive multiple responses to the same prompt from different AI models.
 
@@ -24345,6 +24351,248 @@ function createOpenAICompatibleModel(provider, model, apiKey, baseURL) {
   return openai2(model);
 }
 
+// src/context-packer.ts
+function estimateTokens(text) {
+  return Math.ceil(text.length / 4);
+}
+function estimateMessagesTokens(messages) {
+  return messages.reduce((sum, m) => sum + estimateTokens(m.content) + 4, 0);
+}
+var HIGH_PRIORITY_PATTERNS = [
+  /^diff --git/m,
+  /^@@\s/m,
+  /^\+\+\+\s/m,
+  /^---\s/m,
+  /Error:/i,
+  /error\[/i,
+  /at\s+\S+\s+\(.+:\d+:\d+\)/,
+  // stack trace frame
+  /TypeError|ReferenceError|SyntaxError/,
+  /FAIL|FAILED/,
+  /panic:|fatal:/i,
+  /^\s*\d+\s*\|/m
+  // diagnostic line-numbered output
+];
+var MEDIUM_PRIORITY_PATTERNS = [
+  /```[\s\S]*?```/,
+  /\.(ts|js|py|go|rs|java|tsx|jsx|css|html)\b/,
+  /import\s/,
+  /function\s/,
+  /class\s/,
+  /interface\s/
+];
+function scorePriority(msg, index, totalMessages) {
+  if (msg.role === "system") return "hard";
+  if (msg.role === "user" && index === totalMessages - 1) return "hard";
+  if (msg.role === "user" && index === totalMessages - 2) return "hard";
+  if (index >= totalMessages - 6) return "high";
+  for (const pattern of HIGH_PRIORITY_PATTERNS) {
+    if (pattern.test(msg.content)) return "high";
+  }
+  for (const pattern of MEDIUM_PRIORITY_PATTERNS) {
+    if (pattern.test(msg.content)) return "medium";
+  }
+  return "low";
+}
+function packContext(messages, maxTokens) {
+  const originalTokens = estimateMessagesTokens(messages);
+  if (originalTokens <= maxTokens) {
+    return { messages, originalTokens, packedTokens: originalTokens, droppedCount: 0 };
+  }
+  const scored = messages.map((message, index) => ({
+    message,
+    index,
+    priority: scorePriority(message, index, messages.length),
+    tokens: estimateTokens(message.content) + 4
+  }));
+  const hard = scored.filter((s) => s.priority === "hard");
+  const high = scored.filter((s) => s.priority === "high");
+  const medium = scored.filter((s) => s.priority === "medium");
+  const low = scored.filter((s) => s.priority === "low");
+  let budget = maxTokens;
+  const kept = [];
+  for (const s of hard) {
+    kept.push(s);
+    budget -= s.tokens;
+  }
+  if (budget < 0) {
+    const sortedHard = [...kept].sort((a, b) => b.tokens - a.tokens);
+    for (const s of sortedHard) {
+      if (s.message.role === "system" && budget < 0) {
+        const targetTokens = s.tokens + budget - 100;
+        if (targetTokens > 200) {
+          const targetChars = targetTokens * 4;
+          s.message = { ...s.message, content: s.message.content.slice(0, targetChars) + "\n[... truncated ...]" };
+          s.tokens = estimateTokens(s.message.content) + 4;
+          budget = maxTokens - kept.reduce((sum, k) => sum + k.tokens, 0);
+        }
+      }
+    }
+  }
+  for (const s of high) {
+    if (budget >= s.tokens) {
+      kept.push(s);
+      budget -= s.tokens;
+    } else if (budget > 200) {
+      const targetChars = (budget - 100) * 4;
+      if (targetChars > 200) {
+        const truncated = {
+          ...s,
+          message: { ...s.message, content: s.message.content.slice(0, targetChars) + "\n[... truncated ...]" },
+          tokens: budget - 50
+        };
+        kept.push(truncated);
+        budget -= truncated.tokens;
+      }
+      break;
+    } else {
+      break;
+    }
+  }
+  for (const s of medium) {
+    if (budget >= s.tokens) {
+      kept.push(s);
+      budget -= s.tokens;
+    } else if (budget > 200) {
+      const targetChars = (budget - 100) * 4;
+      if (targetChars > 200) {
+        const truncated = {
+          ...s,
+          message: { ...s.message, content: s.message.content.slice(0, targetChars) + "\n[... truncated ...]" },
+          tokens: budget - 50
+        };
+        kept.push(truncated);
+        budget -= truncated.tokens;
+      }
+      break;
+    } else {
+      break;
+    }
+  }
+  for (const s of low) {
+    if (budget >= s.tokens) {
+      kept.push(s);
+      budget -= s.tokens;
+    } else {
+      break;
+    }
+  }
+  kept.sort((a, b) => a.index - b.index);
+  const packedMessages = kept.map((s) => s.message);
+  const droppedCount = messages.length - packedMessages.length;
+  if (droppedCount > 0) {
+    const lastSystemIdx = packedMessages.findLastIndex((m) => m.role === "system");
+    const insertIdx = lastSystemIdx + 1;
+    packedMessages.splice(insertIdx, 0, {
+      role: "user",
+      content: `[Note: ${droppedCount} earlier messages were omitted to fit context window. The most recent and relevant messages are preserved below.]`
+    });
+  }
+  return {
+    messages: packedMessages,
+    originalTokens,
+    packedTokens: estimateMessagesTokens(packedMessages),
+    droppedCount
+  };
+}
+function estimatePromptTokens(messages) {
+  return estimateMessagesTokens(messages);
+}
+
+// src/panel-router.ts
+var KNOWN_CONTEXT_LIMITS = {
+  "kimi-2.5": 1048576,
+  "qwen3-coder-next": 1048576,
+  "qwen.qwen3-coder-next": 1048576,
+  "deepseek-3.2": 128e3,
+  "glm-5": 128e3,
+  "glm-4.7": 128e3,
+  "glm-4.7-flash": 128e3,
+  "qwen-3": 128e3,
+  "sonnet-4.5": 2e5,
+  "sonnet-4.6": 2e5,
+  "opus-4.5": 2e5,
+  "opus-4.6": 2e5,
+  "opus-4.7": 2e5,
+  "opus-4.8": 2e5
+};
+function getModelId(panel) {
+  if (typeof panel === "string") {
+    const parts2 = panel.split("/");
+    return parts2[parts2.length - 1];
+  }
+  const parts = panel.model.split("/");
+  return parts[parts.length - 1];
+}
+function getPanelMaxContext(panel, defaultLimit) {
+  if (typeof panel !== "string" && panel.maxContext) {
+    return panel.maxContext;
+  }
+  const modelId = getModelId(panel);
+  if (KNOWN_CONTEXT_LIMITS[modelId]) {
+    return KNOWN_CONTEXT_LIMITS[modelId];
+  }
+  return defaultLimit;
+}
+function routePanels(config, messages) {
+  const inputTokens = estimatePromptTokens(messages);
+  const defaultLimit = config.contextLimits.default;
+  const skipThreshold = config.contextLimits.skipThreshold;
+  const assignments = [];
+  for (const panel of config.panel) {
+    const panelLimit = getPanelMaxContext(panel, defaultLimit);
+    if (inputTokens <= panelLimit) {
+      assignments.push({ panelModel: panel, mode: "full", messages });
+    } else if (inputTokens <= skipThreshold) {
+      const packed = packContext(messages, panelLimit);
+      assignments.push({ panelModel: panel, mode: "compact", messages: packed.messages });
+    } else {
+      if (panelLimit >= inputTokens) {
+        assignments.push({ panelModel: panel, mode: "full", messages });
+      } else if (panelLimit >= skipThreshold) {
+        const packed = packContext(messages, panelLimit);
+        assignments.push({ panelModel: panel, mode: "compact", messages: packed.messages });
+      } else {
+        assignments.push({ panelModel: panel, mode: "skip", messages: [] });
+      }
+    }
+  }
+  const active = assignments.filter((a) => a.mode !== "skip");
+  if (active.length === 0) {
+    const largest = [...config.panel].sort(
+      (a, b) => getPanelMaxContext(b, defaultLimit) - getPanelMaxContext(a, defaultLimit)
+    )[0];
+    const largestLimit = getPanelMaxContext(largest, defaultLimit);
+    const packed = packContext(messages, largestLimit);
+    assignments.length = 0;
+    assignments.push({ panelModel: largest, mode: "compact", messages: packed.messages });
+    for (const panel of config.panel) {
+      if (panel !== largest) {
+        assignments.push({ panelModel: panel, mode: "skip", messages: [] });
+      }
+    }
+  }
+  return assignments;
+}
+function getRoutingSummary(assignments) {
+  const lines = [];
+  for (const a of assignments) {
+    const modelId = getModelId(a.panelModel);
+    switch (a.mode) {
+      case "full":
+        lines.push(`- ${modelId}: received FULL context`);
+        break;
+      case "compact":
+        lines.push(`- ${modelId}: received COMPACTED context (some older messages omitted)`);
+        break;
+      case "skip":
+        lines.push(`- ${modelId}: SKIPPED (context too large for model's window)`);
+        break;
+    }
+  }
+  return lines.join("\n");
+}
+
 // src/fusion-model.ts
 function createFusionLanguageModel(config) {
   const modelId = `fusion-${config.panel.length}-panel`;
@@ -24371,7 +24619,8 @@ function createFusionLanguageModel(config) {
           fusion: {
             panelResponses: panelResponses.map((r) => ({
               model: r.model,
-              text: r.text
+              text: r.text,
+              contextMode: r.contextMode
             })),
             strategy: config.strategy
           }
@@ -24422,11 +24671,21 @@ function createFusionLanguageModel(config) {
     }
   };
 }
+function getModelLabel(panelModel) {
+  if (typeof panelModel === "string") return panelModel;
+  return panelModel.model;
+}
 async function queryPanel(config, options) {
   const timeout = config.timeout;
-  const panelPromises = config.panel.map(async (panelModel) => {
-    const model = createProviderModel(panelModel);
-    const promptMessages = convertPromptToMessages(options.prompt);
+  const allMessages = convertPromptToMessages(options.prompt);
+  const assignments = routePanels(config, allMessages);
+  const activeAssignments = assignments.filter((a) => a.mode !== "skip");
+  if (activeAssignments.length === 0) {
+    throw new Error("[opencode-llm-fusion] All panels were skipped. Input too large for any configured panel model.");
+  }
+  const panelPromises = activeAssignments.map(async (assignment) => {
+    const model = createProviderModel(assignment.panelModel);
+    const promptMessages = assignment.messages;
     try {
       const systemMessages = promptMessages.filter((m) => m.role === "system");
       const nonSystemMessages = promptMessages.filter((m) => m.role !== "system");
@@ -24438,20 +24697,22 @@ async function queryPanel(config, options) {
         abortSignal: options.abortSignal
       });
       return {
-        model: `${panelModel.provider}/${panelModel.model}`,
+        model: getModelLabel(assignment.panelModel),
         text: result.text,
         usage: {
           promptTokens: result.usage.inputTokens ?? 0,
           completionTokens: result.usage.outputTokens ?? 0
         },
-        finishReason: result.finishReason
+        finishReason: result.finishReason,
+        contextMode: assignment.mode
       };
     } catch (error) {
       return {
-        model: `${panelModel.provider}/${panelModel.model}`,
+        model: getModelLabel(assignment.panelModel),
         text: `[ERROR: Model failed - ${error instanceof Error ? error.message : "unknown error"}]`,
         usage: { promptTokens: 0, completionTokens: 0 },
-        finishReason: "error"
+        finishReason: "error",
+        contextMode: assignment.mode
       };
     }
   });
@@ -24489,9 +24750,27 @@ async function synthesize(config, panelResponses, _options) {
       return singleJudge(config, panelResponses);
   }
 }
+function buildContextCoverageNote(panelResponses) {
+  const hasCompact = panelResponses.some((r) => r.contextMode === "compact");
+  if (!hasCompact) return "";
+  const lines = [
+    "\n\nIMPORTANT - Context Coverage:",
+    "Not all models received identical context. When models disagree on specifics, prefer responses from models that received FULL context:"
+  ];
+  for (const r of panelResponses) {
+    if (r.contextMode === "full") {
+      lines.push(`  - ${r.model}: FULL context (more reliable for specific details)`);
+    } else {
+      lines.push(`  - ${r.model}: COMPACTED context (may miss details from older messages)`);
+    }
+  }
+  return lines.join("\n");
+}
 async function singleJudge(config, panelResponses) {
   const judgeModel = createProviderModel(config.judge);
-  const systemPrompt = config.judgeSystemPrompt ?? DEFAULT_JUDGE_SYSTEM_PROMPT;
+  const baseSystemPrompt = config.judgeSystemPrompt ?? DEFAULT_JUDGE_SYSTEM_PROMPT;
+  const coverageNote = buildContextCoverageNote(panelResponses);
+  const systemPrompt = baseSystemPrompt + coverageNote;
   const responsesBlock = panelResponses.map((r, i) => `--- Response ${i + 1} (${r.model}) ---
 ${r.text}`).join("\n\n");
   const result = await generateText({
@@ -24521,13 +24800,14 @@ ${responsesBlock}`
 }
 async function majorityVote(config, panelResponses) {
   const judgeModel = createProviderModel(config.judge);
+  const coverageNote = buildContextCoverageNote(panelResponses);
   const responsesBlock = panelResponses.map((r, i) => `--- Response ${i + 1} (${r.model}) ---
 ${r.text}`).join("\n\n");
   const result = await generateText({
     model: judgeModel,
     system: `You are a voting judge. You receive multiple responses to the same prompt.
 Pick the BEST response. Output ONLY the number of the best response (e.g. "1", "2", "3").
-Consider: correctness, completeness, clarity, and relevance.`,
+Consider: correctness, completeness, clarity, and relevance.${coverageNote}`,
     prompt: `Which response is best?
 
 ${responsesBlock}`
@@ -24555,13 +24835,14 @@ ${responsesBlock}`
 }
 async function bestOfN(config, panelResponses) {
   const judgeModel = createProviderModel(config.judge);
+  const coverageNote = buildContextCoverageNote(panelResponses);
   const responsesBlock = panelResponses.map((r, i) => `--- Response ${i + 1} (${r.model}) ---
 ${r.text}`).join("\n\n");
   const result = await generateText({
     model: judgeModel,
     system: `You are a scoring judge. You receive multiple responses to the same prompt.
 Score each response from 1-10 on: correctness, completeness, clarity.
-Output ONLY a JSON array of scores, e.g. [8, 7, 9]. One score per response, in order.`,
+Output ONLY a JSON array of scores, e.g. [8, 7, 9]. One score per response, in order.${coverageNote}`,
     prompt: `Score these responses:
 
 ${responsesBlock}`
@@ -24573,8 +24854,10 @@ ${responsesBlock}`
     scores = panelResponses.map(() => 5);
   }
   const weightedScores = scores.map((score, i) => {
-    const weight = config.panel[i]?.weight ?? 1;
-    return score * weight;
+    const panel = config.panel[i];
+    const weight = typeof panel !== "string" && panel?.weight ? panel.weight : 1;
+    const contextBoost = panelResponses[i]?.contextMode === "full" ? 1.1 : 1;
+    return score * weight * contextBoost;
   });
   const bestIndex = weightedScores.indexOf(Math.max(...weightedScores));
   const selected = panelResponses[bestIndex] ?? panelResponses[0];
@@ -24758,6 +25041,10 @@ export {
   FusionConfigSchema,
   createFusion,
   createFusionLanguageModel,
+  estimatePromptTokens,
+  getRoutingSummary,
+  packContext,
+  routePanels,
   shouldUseFusion
 };
 //# sourceMappingURL=index.js.map

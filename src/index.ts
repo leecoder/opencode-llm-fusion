@@ -3,10 +3,13 @@ import { FusionConfigSchema } from "./config.js";
 import { createFusionLanguageModel } from "./fusion-model.js";
 import { shouldUseFusion } from "./routing.js";
 
-export type { FusionConfig, SynthesisStrategy, PanelModel, JudgeModel } from "./config.js";
+export type { FusionConfig, SynthesisStrategy, PanelModel, JudgeModel, ContextLimits } from "./config.js";
 export { FusionConfigSchema, DEFAULT_JUDGE_SYSTEM_PROMPT } from "./config.js";
 export { createFusionLanguageModel } from "./fusion-model.js";
 export { shouldUseFusion } from "./routing.js";
+export { packContext, estimatePromptTokens } from "./context-packer.js";
+export { routePanels, getRoutingSummary } from "./panel-router.js";
+export type { PanelContextMode, PanelAssignment } from "./panel-router.js";
 
 function loadConfig(): FusionConfig | null {
   const fs = require("fs");
