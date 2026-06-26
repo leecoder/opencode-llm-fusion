@@ -20,7 +20,8 @@
     "build": "tsup",
     "prepublishOnly": "tsup",
     "dev": "tsup --watch",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.js"
   },
   "repository": {
     "type": "git",

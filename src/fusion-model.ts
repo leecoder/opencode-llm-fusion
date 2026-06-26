@@ -8,6 +8,7 @@ import type { FusionConfig, PanelModel, JudgeModel, SynthesisStrategy } from "./
 import { DEFAULT_JUDGE_SYSTEM_PROMPT } from "./config.js";
 import { createProviderModel } from "./providers.js";
 import { routePanels, getRoutingSummary, type PanelAssignment, type PanelContextMode } from "./panel-router.js";
+import type { MultimodalMessage, ContentPart } from "./types.js";
 
 export interface FusionUsage {
   panelTokens: { model: string; promptTokens: number; completionTokens: number }[];
@@ -140,12 +141,20 @@ async function queryPanel(
     try {
       const systemMessages = promptMessages.filter((m) => m.role === "system");
       const nonSystemMessages = promptMessages.filter((m) => m.role !== "system");
-      const systemText = systemMessages.map((m) => m.content).join("\n");
+      const systemText = systemMessages
+        .map((m) => typeof m.content === "string" ? m.content : "")
+        .filter(Boolean)
+        .join("\n");
+
+      const aiMessages = nonSystemMessages.map((m) => ({
+        role: m.role as "user" | "assistant",
+        content: m.content,
+      }));
 
       const result = await generateText({
         model,
         ...(systemText && { system: systemText }),
-        messages: nonSystemMessages,
+        messages: aiMessages as any,
         abortSignal: options.abortSignal,
       });
 
@@ -383,12 +392,12 @@ Output ONLY a JSON array of scores, e.g. [8, 7, 9]. One score per response, in o
 
 function convertPromptToMessages(
   prompt: LanguageModelV3CallOptions["prompt"]
-): Array<{ role: "system" | "user" | "assistant"; content: string }> {
+): MultimodalMessage[] {
   if (!prompt || !Array.isArray(prompt) || prompt.length === 0) {
     return [{ role: "user", content: "hello" }];
   }
 
-  const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [];
+  const messages: MultimodalMessage[] = [];
 
   for (const msg of prompt) {
     if (msg.role === "system") {
@@ -398,11 +407,20 @@ function convertPromptToMessages(
       if (typeof msg.content === "string") {
         messages.push({ role: "user", content: msg.content });
       } else if (Array.isArray(msg.content)) {
-        const textParts = msg.content
-          .filter((part: any) => part.type === "text")
-          .map((part: any) => part.text);
-        if (textParts.length > 0) {
-          messages.push({ role: "user", content: textParts.join("\n") });
+        const parts: ContentPart[] = [];
+        for (const part of msg.content) {
+          if ((part as any).type === "text") {
+            parts.push({ type: "text", text: (part as any).text });
+          } else if ((part as any).type === "image") {
+            parts.push({
+              type: "image",
+              image: (part as any).image ?? (part as any).url ?? (part as any).data,
+              mimeType: (part as any).mimeType,
+            });
+          }
+        }
+        if (parts.length > 0) {
+          messages.push({ role: "user", content: parts });
         }
       }
     } else if (msg.role === "assistant") {

@@ -8,8 +8,9 @@ export { FusionConfigSchema, DEFAULT_JUDGE_SYSTEM_PROMPT } from "./config.js";
 export { createFusionLanguageModel } from "./fusion-model.js";
 export { shouldUseFusion } from "./routing.js";
 export { packContext, estimatePromptTokens } from "./context-packer.js";
-export { routePanels, getRoutingSummary } from "./panel-router.js";
+export { routePanels, getRoutingSummary, hasImages } from "./panel-router.js";
 export type { PanelContextMode, PanelAssignment } from "./panel-router.js";
+export type { MultimodalMessage, ContentPart } from "./types.js";
 
 function loadConfig(): FusionConfig | null {
   const fs = require("fs");

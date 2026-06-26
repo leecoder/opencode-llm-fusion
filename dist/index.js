@@ -24216,6 +24216,7 @@ var PanelModelSchema = z.union([
     model: z.string().describe("OpenCode provider/model reference or raw model ID"),
     weight: z.number().default(1),
     maxContext: z.number().optional().describe("Max context tokens this model supports. Used for selective routing."),
+    supportsImages: z.boolean().optional().describe("Whether this model supports image input."),
     provider: z.string().optional(),
     apiKey: z.string().optional(),
     baseURL: z.string().optional()
@@ -24516,6 +24517,23 @@ var KNOWN_CONTEXT_LIMITS = {
   "opus-4.7": 2e5,
   "opus-4.8": 2e5
 };
+var KNOWN_IMAGE_SUPPORT = {
+  "kimi-2.5": true,
+  "glm-5": true,
+  "glm-4.7": true,
+  "glm-4.7-flash": true,
+  "qwen-3": true,
+  "qwen.qwen3-vl-235b-a22b": true,
+  "sonnet-4.5": true,
+  "sonnet-4.6": true,
+  "opus-4.5": true,
+  "opus-4.6": true,
+  "opus-4.7": true,
+  "opus-4.8": true,
+  "deepseek-3.2": false,
+  "qwen3-coder-next": false,
+  "qwen.qwen3-coder-next": false
+};
 function getModelId(panel) {
   if (typeof panel === "string") {
     const parts2 = panel.split("/");
@@ -24534,23 +24552,50 @@ function getPanelMaxContext(panel, defaultLimit) {
   }
   return defaultLimit;
 }
+function panelSupportsImages(panel) {
+  if (typeof panel !== "string" && panel.supportsImages !== void 0) {
+    return panel.supportsImages;
+  }
+  const modelId = getModelId(panel);
+  return KNOWN_IMAGE_SUPPORT[modelId] ?? false;
+}
+function hasImages(messages) {
+  return messages.some(
+    (m) => Array.isArray(m.content) && m.content.some((p) => p.type === "image")
+  );
+}
+function stripImages(messages) {
+  return messages.map((m) => {
+    if (!Array.isArray(m.content)) return m;
+    const textParts = m.content.filter((p) => p.type === "text");
+    if (textParts.length === 0) return { ...m, content: [{ type: "text", text: "[image omitted - model does not support images]" }] };
+    return { ...m, content: textParts };
+  });
+}
 function routePanels(config, messages) {
-  const inputTokens = estimatePromptTokens(messages);
+  const textMessages = messages.map((m) => ({
+    role: m.role,
+    content: Array.isArray(m.content) ? m.content.filter((p) => p.type === "text").map((p) => p.text).join("\n") : m.content
+  }));
+  const inputTokens = estimatePromptTokens(textMessages);
   const defaultLimit = config.contextLimits.default;
   const skipThreshold = config.contextLimits.skipThreshold;
+  const inputHasImages = hasImages(messages);
   const assignments = [];
   for (const panel of config.panel) {
     const panelLimit = getPanelMaxContext(panel, defaultLimit);
+    const supportsImg = panelSupportsImages(panel);
+    const panelMessages = inputHasImages && !supportsImg ? stripImages(messages) : messages;
     if (inputTokens <= panelLimit) {
-      assignments.push({ panelModel: panel, mode: "full", messages });
+      assignments.push({ panelModel: panel, mode: "full", messages: panelMessages });
     } else if (inputTokens <= skipThreshold) {
-      const packed = packContext(messages, panelLimit);
+      const packed = packContext(textMessages, panelLimit);
       assignments.push({ panelModel: panel, mode: "compact", messages: packed.messages });
     } else {
       if (panelLimit >= inputTokens) {
-        assignments.push({ panelModel: panel, mode: "full", messages });
+        assignments.push({ panelModel: panel, mode: "full", messages: panelMessages });
       } else if (panelLimit >= skipThreshold) {
-        const packed = packContext(messages, panelLimit);
+        const packed = packContext(textMessages, panelLimit);
         assignments.push({ panelModel: panel, mode: "compact", messages: packed.messages });
       } else {
         assignments.push({ panelModel: panel, mode: "skip", messages: [] });
@@ -24563,7 +24608,7 @@ function routePanels(config, messages) {
       (a, b) => getPanelMaxContext(b, defaultLimit) - getPanelMaxContext(a, defaultLimit)
     )[0];
     const largestLimit = getPanelMaxContext(largest, defaultLimit);
-    const packed = packContext(messages, largestLimit);
+    const packed = packContext(textMessages, largestLimit);
     assignments.length = 0;
     assignments.push({ panelModel: largest, mode: "compact", messages: packed.messages });
     for (const panel of config.panel) {
@@ -24689,11 +24734,15 @@ async function queryPanel(config, options) {
     try {
       const systemMessages = promptMessages.filter((m) => m.role === "system");
       const nonSystemMessages = promptMessages.filter((m) => m.role !== "system");
-      const systemText = systemMessages.map((m) => m.content).join("\n");
+      const systemText = systemMessages.map((m) => typeof m.content === "string" ? m.content : "").filter(Boolean).join("\n");
+      const aiMessages = nonSystemMessages.map((m) => ({
+        role: m.role,
+        content: m.content
+      }));
       const result = await generateText({
         model,
         ...systemText && { system: systemText },
-        messages: nonSystemMessages,
+        messages: aiMessages,
         abortSignal: options.abortSignal
       });
       return {
@@ -24892,9 +24941,20 @@ function convertPromptToMessages(prompt) {
       if (typeof msg.content === "string") {
         messages.push({ role: "user", content: msg.content });
       } else if (Array.isArray(msg.content)) {
-        const textParts = msg.content.filter((part) => part.type === "text").map((part) => part.text);
-        if (textParts.length > 0) {
-          messages.push({ role: "user", content: textParts.join("\n") });
+        const parts = [];
+        for (const part of msg.content) {
+          if (part.type === "text") {
+            parts.push({ type: "text", text: part.text });
+          } else if (part.type === "image") {
+            parts.push({
+              type: "image",
+              image: part.image ?? part.url ?? part.data,
+              mimeType: part.mimeType
+            });
+          }
+        }
+        if (parts.length > 0) {
+          messages.push({ role: "user", content: parts });
         }
       }
     } else if (msg.role === "assistant") {
@@ -25043,6 +25103,7 @@ export {
   createFusionLanguageModel,
   estimatePromptTokens,
   getRoutingSummary,
+  hasImages,
   packContext,
   routePanels,
   shouldUseFusion

@@ -14,6 +14,7 @@ export const PanelModelSchema = z.union([
     model: z.string().describe("OpenCode provider/model reference or raw model ID"),
     weight: z.number().default(1),
     maxContext: z.number().optional().describe("Max context tokens this model supports. Used for selective routing."),
+    supportsImages: z.boolean().optional().describe("Whether this model supports image input."),
     provider: z.string().optional(),
     apiKey: z.string().optional(),
     baseURL: z.string().optional(),
