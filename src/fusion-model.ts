@@ -286,17 +286,21 @@ async function queryPanel(
     }
   });
 
-  const timeoutPromise = new Promise<never>((_, reject) =>
-    setTimeout(() => {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => {
       timeoutController.abort();
       reject(new Error(timeoutMessage));
-    }, timeout)
-  );
+    }, timeout);
+  });
 
   let results: PanelResponse[];
   try {
     results = await Promise.race([Promise.all(panelPromises), timeoutPromise]);
   } finally {
+    if (timeoutId !== undefined) {
+      clearTimeout(timeoutId);
+    }
     timeoutController.abort();
   }
 
