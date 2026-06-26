@@ -93,7 +93,7 @@ Or reference directly in `opencode.json` without a separate install step — Ope
         "panel-3": {
           "name": "Fusion 3-Panel",
           "id": "panel-3",
-          "limit": { "context": 1048576, "output": 64000 },
+          "limit": { "context": 1000000, "output": 64000 },
           "modalities": { "input": ["text"], "output": ["text"] }
         }
       }
@@ -108,19 +108,11 @@ Or reference directly in `opencode.json` without a separate install step — Ope
 
 ```json
 {
-  "panel": [
-    { "model": "litellm/deepseek-3.2", "maxContext": 128000 },
-    { "model": "litellm/glm-5", "maxContext": 128000 },
-    { "model": "litellm/kimi-2.5", "weight": 1.5, "maxContext": 1048576 }
-  ],
+  "panel": ["litellm/deepseek-3.2", "litellm/glm-5", { "model": "litellm/kimi-2.5", "weight": 1.5 }],
   "judge": "litellm/glm-4.7-flash",
   "strategy": "single_judge",
   "routing": { "mode": "always" },
-  "timeout": 90000,
-  "contextLimits": {
-    "default": 128000,
-    "skipThreshold": 256000
-  }
+  "timeout": 90000
 }
 ```
 
