@@ -156,6 +156,7 @@ async function queryPanel(
         ...(systemText && { system: systemText }),
         messages: aiMessages as any,
         abortSignal: options.abortSignal,
+        maxTokens: options.maxOutputTokens ?? 16384,
       });
 
       return {
@@ -257,6 +258,7 @@ async function singleJudge(
     model: judgeModel,
     system: systemPrompt,
     prompt: `Here are ${panelResponses.length} responses to synthesize:\n\n${responsesBlock}`,
+    maxTokens: 16384,
   });
 
   const panelTokens = panelResponses.map((r) => ({
@@ -299,6 +301,7 @@ async function majorityVote(
 Pick the BEST response. Output ONLY the number of the best response (e.g. "1", "2", "3").
 Consider: correctness, completeness, clarity, and relevance.${coverageNote}`,
     prompt: `Which response is best?\n\n${responsesBlock}`,
+    maxTokens: 64,
   });
 
   const voteText = result.text.trim();
@@ -348,6 +351,7 @@ async function bestOfN(
 Score each response from 1-10 on: correctness, completeness, clarity.
 Output ONLY a JSON array of scores, e.g. [8, 7, 9]. One score per response, in order.${coverageNote}`,
     prompt: `Score these responses:\n\n${responsesBlock}`,
+    maxTokens: 128,
   });
 
   let scores: number[];

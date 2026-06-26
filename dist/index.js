@@ -24261,7 +24261,10 @@ Rules:
 - When models disagree on facts, note the disagreement and provide the most likely correct answer with reasoning.
 - Preserve code exactly when models agree on implementation. When they differ, pick the most correct/idiomatic version and explain why.
 - Do NOT mention that you are synthesizing multiple responses. Respond as if you are the sole author.
-- Match the format and style appropriate for the original question.`;
+- Match the format and style appropriate for the original question.
+- Be CONCISE. Your answer should be shorter than the longest panel response, not longer. Strip redundancy, filler, and repetition.
+- If the original prompt is simple (e.g. a greeting), respond simply. Do NOT over-elaborate.
+- Never repeat yourself. Say each thing exactly once.`;
 
 // src/fusion-model.ts
 import { generateText } from "ai";
@@ -24332,17 +24335,54 @@ function createAnthropicModel(model, apiKey, baseURL) {
   });
   return anthropic2(model);
 }
+function loadOpenCodeProviderConfig(providerName) {
+  const fs = __require("fs");
+  const path = __require("path");
+  const candidates = [
+    path.join(process.cwd(), ".opencode", "opencode.json"),
+    path.join(process.cwd(), ".opencode", "opencode.jsonc"),
+    path.join(process.env.HOME ?? "~", ".config", "opencode", "opencode.json"),
+    path.join(process.env.HOME ?? "~", ".config", "opencode", "opencode.jsonc")
+  ];
+  for (const candidate of candidates) {
+    try {
+      if (!fs.existsSync(candidate)) continue;
+      const raw = fs.readFileSync(candidate, "utf-8");
+      const cleaned = candidate.endsWith(".jsonc") ? raw.replace(/(?<![:"\\])\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "") : raw;
+      const parsed = JSON.parse(cleaned);
+      const provider = parsed?.provider?.[providerName];
+      if (provider) {
+        return {
+          baseURL: provider.api || provider.baseURL,
+          apiKey: provider.options?.apiKey || provider.apiKey
+        };
+      }
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
 function createOpenAICompatibleModel(provider, model, apiKey, baseURL) {
   const { createOpenAI: createOpenAI2 } = (init_dist4(), __toCommonJS(dist_exports));
-  const providerBaseURLs = {
-    litellm: process.env.LITELLM_BASE_URL ?? "",
-    openrouter: "https://openrouter.ai/api/v1"
-  };
-  const resolvedBaseURL = baseURL ?? providerBaseURLs[provider];
-  const resolvedApiKey = apiKey ?? process.env[`${provider.toUpperCase()}_API_KEY`] ?? process.env.LITELLM_API_KEY;
+  let resolvedBaseURL = baseURL;
+  let resolvedApiKey = apiKey;
+  if (!resolvedBaseURL || !resolvedApiKey) {
+    const opencodeConfig = loadOpenCodeProviderConfig(provider);
+    if (opencodeConfig) {
+      resolvedBaseURL = resolvedBaseURL ?? opencodeConfig.baseURL;
+      resolvedApiKey = resolvedApiKey ?? opencodeConfig.apiKey;
+    }
+  }
+  if (!resolvedBaseURL) {
+    resolvedBaseURL = process.env[`${provider.toUpperCase()}_BASE_URL`] ?? process.env.LITELLM_BASE_URL;
+  }
+  if (!resolvedApiKey) {
+    resolvedApiKey = process.env[`${provider.toUpperCase()}_API_KEY`] ?? process.env.LITELLM_API_KEY;
+  }
   if (!resolvedBaseURL) {
     throw new Error(
-      `Unknown provider "${provider}". Set baseURL explicitly or use a known provider (openai, google, anthropic, litellm).`
+      `Provider "${provider}" not found. Configure it in opencode.json, set ${provider.toUpperCase()}_BASE_URL env var, or use baseURL in panel config.`
     );
   }
   const openai2 = createOpenAI2({
@@ -24743,7 +24783,8 @@ async function queryPanel(config, options) {
         model,
         ...systemText && { system: systemText },
         messages: aiMessages,
-        abortSignal: options.abortSignal
+        abortSignal: options.abortSignal,
+        maxTokens: options.maxOutputTokens ?? 16384
       });
       return {
         model: getModelLabel(assignment.panelModel),
@@ -24827,7 +24868,8 @@ ${r.text}`).join("\n\n");
     system: systemPrompt,
     prompt: `Here are ${panelResponses.length} responses to synthesize:
 
-${responsesBlock}`
+${responsesBlock}`,
+    maxTokens: 16384
   });
   const panelTokens = panelResponses.map((r) => ({
     model: r.model,
@@ -24859,7 +24901,8 @@ Pick the BEST response. Output ONLY the number of the best response (e.g. "1", "
 Consider: correctness, completeness, clarity, and relevance.${coverageNote}`,
     prompt: `Which response is best?
 
-${responsesBlock}`
+${responsesBlock}`,
+    maxTokens: 64
   });
   const voteText = result.text.trim();
   const voteIndex = parseInt(voteText, 10) - 1;
@@ -24894,7 +24937,8 @@ Score each response from 1-10 on: correctness, completeness, clarity.
 Output ONLY a JSON array of scores, e.g. [8, 7, 9]. One score per response, in order.${coverageNote}`,
     prompt: `Score these responses:
 
-${responsesBlock}`
+${responsesBlock}`,
+    maxTokens: 128
   });
   let scores;
   try {

@@ -94,6 +94,39 @@ function createAnthropicModel(
   return anthropic(model);
 }
 
+function loadOpenCodeProviderConfig(providerName: string): { baseURL?: string; apiKey?: string } | null {
+  const fs = require("fs");
+  const path = require("path");
+
+  const candidates = [
+    path.join(process.cwd(), ".opencode", "opencode.json"),
+    path.join(process.cwd(), ".opencode", "opencode.jsonc"),
+    path.join(process.env.HOME ?? "~", ".config", "opencode", "opencode.json"),
+    path.join(process.env.HOME ?? "~", ".config", "opencode", "opencode.jsonc"),
+  ];
+
+  for (const candidate of candidates) {
+    try {
+      if (!fs.existsSync(candidate)) continue;
+      const raw = fs.readFileSync(candidate, "utf-8");
+      const cleaned = candidate.endsWith(".jsonc")
+        ? raw.replace(/(?<![:"\\])\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "")
+        : raw;
+      const parsed = JSON.parse(cleaned);
+      const provider = parsed?.provider?.[providerName];
+      if (provider) {
+        return {
+          baseURL: provider.api || provider.baseURL,
+          apiKey: provider.options?.apiKey || provider.apiKey,
+        };
+      }
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
 function createOpenAICompatibleModel(
   provider: string,
   model: string,
@@ -102,19 +135,29 @@ function createOpenAICompatibleModel(
 ): LanguageModelV3 {
   const { createOpenAI } = require("@ai-sdk/openai");
 
-  const providerBaseURLs: Record<string, string> = {
-    litellm: process.env.LITELLM_BASE_URL ?? "",
-    openrouter: "https://openrouter.ai/api/v1",
-  };
+  let resolvedBaseURL = baseURL;
+  let resolvedApiKey = apiKey;
 
-  const resolvedBaseURL = baseURL ?? providerBaseURLs[provider];
-  const resolvedApiKey = apiKey
-    ?? process.env[`${provider.toUpperCase()}_API_KEY`]
-    ?? process.env.LITELLM_API_KEY;
+  if (!resolvedBaseURL || !resolvedApiKey) {
+    const opencodeConfig = loadOpenCodeProviderConfig(provider);
+    if (opencodeConfig) {
+      resolvedBaseURL = resolvedBaseURL ?? opencodeConfig.baseURL;
+      resolvedApiKey = resolvedApiKey ?? opencodeConfig.apiKey;
+    }
+  }
+
+  if (!resolvedBaseURL) {
+    resolvedBaseURL = process.env[`${provider.toUpperCase()}_BASE_URL`]
+      ?? process.env.LITELLM_BASE_URL;
+  }
+  if (!resolvedApiKey) {
+    resolvedApiKey = process.env[`${provider.toUpperCase()}_API_KEY`]
+      ?? process.env.LITELLM_API_KEY;
+  }
 
   if (!resolvedBaseURL) {
     throw new Error(
-      `Unknown provider "${provider}". Set baseURL explicitly or use a known provider (openai, google, anthropic, litellm).`
+      `Provider "${provider}" not found. Configure it in opencode.json, set ${provider.toUpperCase()}_BASE_URL env var, or use baseURL in panel config.`
     );
   }
 

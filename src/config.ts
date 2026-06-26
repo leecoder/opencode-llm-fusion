@@ -74,4 +74,7 @@ Rules:
 - When models disagree on facts, note the disagreement and provide the most likely correct answer with reasoning.
 - Preserve code exactly when models agree on implementation. When they differ, pick the most correct/idiomatic version and explain why.
 - Do NOT mention that you are synthesizing multiple responses. Respond as if you are the sole author.
-- Match the format and style appropriate for the original question.`;
+- Match the format and style appropriate for the original question.
+- Be CONCISE. Your answer should be shorter than the longest panel response, not longer. Strip redundancy, filler, and repetition.
+- If the original prompt is simple (e.g. a greeting), respond simply. Do NOT over-elaborate.
+- Never repeat yourself. Say each thing exactly once.`;
