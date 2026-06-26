@@ -24772,6 +24772,8 @@ Rules:
 
 ---
 `;
+var REPETITION_MIN_LENGTH = 800;
+var REPETITION_WINDOW_CHARS = 3072;
 function detectRepetition(text) {
   if (text.length < 400) return false;
   const lastChunk = text.slice(-200);
@@ -24795,14 +24797,21 @@ async function streamPanelWithCutoff(model, systemText, messages, abortSignal, m
     abortSignal: combinedSignal,
     maxTokens
   });
-  let fullText = "";
+  const chunks = [];
+  let rollingWindow = "";
+  let totalLength = 0;
   let inputTokens = 0;
   let outputTokens = 0;
   let finishReason = "stop";
   try {
     for await (const chunk of stream.textStream) {
-      fullText += chunk;
-      if (fullText.length > 800 && detectRepetition(fullText)) {
+      chunks.push(chunk);
+      totalLength += chunk.length;
+      rollingWindow += chunk;
+      if (rollingWindow.length > REPETITION_WINDOW_CHARS) {
+        rollingWindow = rollingWindow.slice(-REPETITION_WINDOW_CHARS);
+      }
+      if (totalLength > REPETITION_MIN_LENGTH && detectRepetition(rollingWindow)) {
         controller.abort();
         finishReason = "repetition-cutoff";
         break;
@@ -24822,6 +24831,7 @@ async function streamPanelWithCutoff(model, systemText, messages, abortSignal, m
       throw e;
     }
   }
+  const fullText = chunks.join("");
   return { text: fullText, usage: { promptTokens: inputTokens, completionTokens: outputTokens }, finishReason };
 }
 async function queryPanel(config, options) {
@@ -24832,22 +24842,33 @@ async function queryPanel(config, options) {
   if (activeAssignments.length === 0) {
     throw new Error("[opencode-llm-fusion] All panels were skipped. Input too large for any configured panel model.");
   }
+  const timeoutController = new AbortController();
+  const panelAbortSignal = options.abortSignal ? AbortSignal.any([options.abortSignal, timeoutController.signal]) : timeoutController.signal;
+  const timeoutMessage = `Fusion panel timeout after ${timeout}ms`;
   const panelPromises = activeAssignments.map(async (assignment) => {
     const model = createProviderModel(assignment.panelModel);
     const promptMessages = assignment.messages;
     try {
-      const systemMessages = promptMessages.filter((m) => m.role === "system");
-      const nonSystemMessages = promptMessages.filter((m) => m.role !== "system");
-      const systemText = systemMessages.map((m) => typeof m.content === "string" ? m.content : "").filter(Boolean).join("\n");
-      const aiMessages = nonSystemMessages.map((m) => ({
-        role: m.role,
-        content: m.content
-      }));
+      const systemTextParts = [];
+      const aiMessages = [];
+      for (const message of promptMessages) {
+        if (message.role === "system") {
+          if (typeof message.content === "string" && message.content) {
+            systemTextParts.push(message.content);
+          }
+          continue;
+        }
+        aiMessages.push({
+          role: message.role,
+          content: message.content
+        });
+      }
+      const systemText = systemTextParts.join("\n");
       const result = await streamPanelWithCutoff(
         model,
         systemText,
         aiMessages,
-        options.abortSignal,
+        panelAbortSignal,
         options.maxOutputTokens ?? 16384
       );
       return {
@@ -24870,12 +24891,18 @@ async function queryPanel(config, options) {
       };
     }
   });
-  const results = await Promise.race([
-    Promise.all(panelPromises),
-    new Promise(
-      (_, reject) => setTimeout(() => reject(new Error(`Fusion panel timeout after ${timeout}ms`)), timeout)
-    )
-  ]);
+  const timeoutPromise = new Promise(
+    (_, reject) => setTimeout(() => {
+      timeoutController.abort();
+      reject(new Error(timeoutMessage));
+    }, timeout)
+  );
+  let results;
+  try {
+    results = await Promise.race([Promise.all(panelPromises), timeoutPromise]);
+  } finally {
+    timeoutController.abort();
+  }
   return results.filter((r) => r.finishReason !== "error" || results.length <= 2);
 }
 async function synthesize(config, panelResponses, _options) {
