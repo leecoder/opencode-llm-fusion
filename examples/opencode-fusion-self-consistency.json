@@ -1,0 +1,16 @@
+{
+  "panel": [
+    { "provider": "openai", "model": "gpt-4o" },
+    { "provider": "openai", "model": "gpt-4o" },
+    { "provider": "openai", "model": "gpt-4o" }
+  ],
+  "judge": {
+    "provider": "openai",
+    "model": "gpt-4o"
+  },
+  "strategy": "single_judge",
+  "routing": {
+    "mode": "always"
+  },
+  "timeout": 120000
+}

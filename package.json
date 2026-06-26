@@ -1,0 +1,56 @@
+{
+  "name": "opencode-llm-fusion",
+  "version": "0.1.0",
+  "description": "Multi-LLM Fusion provider for OpenCode — parallel model generation with judge synthesis",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "README.ko.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "prepublishOnly": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/leecoder/opencode-llm-fusion.git"
+  },
+  "keywords": [
+    "opencode",
+    "provider",
+    "fusion",
+    "multi-llm",
+    "orchestration",
+    "ensemble",
+    "ai-sdk"
+  ],
+  "license": "MIT",
+  "peerDependencies": {
+    "@ai-sdk/provider": ">=1.0.0",
+    "ai": ">=4.0.0"
+  },
+  "optionalDependencies": {
+    "@ai-sdk/openai": ">=1.0.0",
+    "@ai-sdk/google": ">=1.0.0",
+    "@ai-sdk/anthropic": ">=1.0.0"
+  },
+  "dependencies": {
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.1",
+    "tsup": "^8.0.0",
+    "typescript": "^5.5.0"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "panel": [
+    { "provider": "openai", "model": "gpt-4o" },
+    { "provider": "google", "model": "gemini-2.5-flash" },
+    { "provider": "anthropic", "model": "claude-sonnet-4-6" }
+  ],
+  "judge": {
+    "provider": "anthropic",
+    "model": "claude-opus-4-6"
+  },
+  "strategy": "single_judge",
+  "routing": {
+    "mode": "always"
+  },
+  "timeout": 120000
+}

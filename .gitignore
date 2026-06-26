@@ -1,0 +1,4 @@
+node_modules/
+*.map
+benchmark-results.json
+bench-coding-results.json

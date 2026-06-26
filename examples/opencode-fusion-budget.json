@@ -1,0 +1,17 @@
+{
+  "panel": [
+    { "provider": "openai", "model": "gpt-4o", "weight": 1.0 },
+    { "provider": "google", "model": "gemini-2.5-flash", "weight": 0.9 },
+    { "provider": "openai", "model": "deepseek-chat", "baseURL": "https://api.deepseek.com/v1", "weight": 0.8 }
+  ],
+  "judge": {
+    "provider": "anthropic",
+    "model": "claude-sonnet-4-6"
+  },
+  "strategy": "single_judge",
+  "routing": {
+    "mode": "auto",
+    "complexityThreshold": 0.5
+  },
+  "timeout": 90000
+}
