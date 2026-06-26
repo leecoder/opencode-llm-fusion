@@ -3,7 +3,7 @@ import type {
   LanguageModelV3CallOptions,
   LanguageModelV3StreamPart,
 } from "@ai-sdk/provider";
-import { generateText } from "ai";
+import { generateText, streamText } from "ai";
 import type { FusionConfig, PanelModel, JudgeModel, SynthesisStrategy } from "./config.js";
 import { DEFAULT_JUDGE_SYSTEM_PROMPT } from "./config.js";
 import { createProviderModel } from "./providers.js";
@@ -120,6 +120,89 @@ function getModelLabel(panelModel: PanelModel): string {
   return panelModel.model;
 }
 
+const PANEL_SYSTEM_PREFIX = `You are one of several AI models answering the same question in parallel. Your response will be compared with others by a judge.
+
+Rules:
+- Answer the user's question directly and concisely.
+- Do NOT ask the user for more context, clarification, or prior state.
+- Do NOT roleplay as a specific assistant or agent.
+- Do NOT mention that you lack context from previous sessions.
+- If the question is a simple greeting, respond with a simple greeting.
+- Focus on providing the best possible answer to what was asked.
+
+---
+`;
+
+function detectRepetition(text: string): boolean {
+  if (text.length < 400) return false;
+  const lastChunk = text.slice(-200);
+  const earlier = text.slice(0, -200);
+  if (earlier.includes(lastChunk)) return true;
+
+  const sentences = text.split(/[.!?\n]+/).filter((s) => s.trim().length > 20);
+  if (sentences.length < 6) return false;
+  const lastThree = sentences.slice(-3).map((s) => s.trim());
+  const rest = sentences.slice(0, -3).map((s) => s.trim());
+  const repeated = lastThree.filter((s) => rest.includes(s));
+  return repeated.length >= 2;
+}
+
+async function streamPanelWithCutoff(
+  model: any,
+  systemText: string,
+  messages: any[],
+  abortSignal: AbortSignal | undefined,
+  maxTokens: number,
+): Promise<{ text: string; usage: { promptTokens: number; completionTokens: number }; finishReason: string }> {
+  const controller = new AbortController();
+  const combinedSignal = abortSignal
+    ? AbortSignal.any([abortSignal, controller.signal])
+    : controller.signal;
+
+  const panelSystem = PANEL_SYSTEM_PREFIX + systemText;
+
+  const stream = streamText({
+    model,
+    ...(panelSystem && { system: panelSystem }),
+    messages,
+    abortSignal: combinedSignal,
+    maxTokens,
+  });
+
+  let fullText = "";
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let finishReason = "stop";
+
+  try {
+    for await (const chunk of stream.textStream) {
+      fullText += chunk;
+
+      if (fullText.length > 800 && detectRepetition(fullText)) {
+        controller.abort();
+        finishReason = "repetition-cutoff";
+        break;
+      }
+    }
+
+    const usage = await stream.usage;
+    inputTokens = usage?.inputTokens ?? 0;
+    outputTokens = usage?.outputTokens ?? 0;
+    if (finishReason === "stop") {
+      finishReason = (await stream.finishReason) ?? "stop";
+    }
+  } catch (e: any) {
+    if (e?.name === "AbortError" && finishReason === "repetition-cutoff") {
+    } else if (e?.name === "AbortError") {
+      finishReason = "aborted";
+    } else {
+      throw e;
+    }
+  }
+
+  return { text: fullText, usage: { promptTokens: inputTokens, completionTokens: outputTokens }, finishReason };
+}
+
 async function queryPanel(
   config: FusionConfig,
   options: LanguageModelV3CallOptions
@@ -151,20 +234,20 @@ async function queryPanel(
         content: m.content,
       }));
 
-      const result = await generateText({
+      const result = await streamPanelWithCutoff(
         model,
-        ...(systemText && { system: systemText }),
-        messages: aiMessages as any,
-        abortSignal: options.abortSignal,
-        maxTokens: options.maxOutputTokens ?? 16384,
-      });
+        systemText,
+        aiMessages as any,
+        options.abortSignal,
+        options.maxOutputTokens ?? 16384,
+      );
 
       return {
         model: getModelLabel(assignment.panelModel),
         text: result.text,
         usage: {
-          promptTokens: result.usage.inputTokens ?? 0,
-          completionTokens: result.usage.outputTokens ?? 0,
+          promptTokens: result.usage.promptTokens,
+          completionTokens: result.usage.completionTokens,
         },
         finishReason: result.finishReason,
         contextMode: assignment.mode,
