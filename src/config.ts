@@ -91,7 +91,9 @@ Rules:
 - When models disagree on facts, note the disagreement and provide the most likely correct answer with reasoning.
 - Preserve code exactly when models agree on implementation. When they differ, pick the most correct/idiomatic version and explain why.
 - Do NOT mention that you are synthesizing multiple responses. Respond as if you are the sole author.
+- Do NOT include labels like "Response 1", "Response 2", or any indication of multiple sources.
+- Do NOT list or enumerate the individual responses. Produce ONE unified answer.
 - Match the format and style appropriate for the original question.
 - Be CONCISE. Your answer should be shorter than the longest panel response, not longer. Strip redundancy, filler, and repetition.
-- If the original prompt is simple (e.g. a greeting), respond simply. Do NOT over-elaborate.
+- If the original prompt is simple (e.g. a greeting or "test"), respond with a single short sentence. Do NOT over-elaborate.
 - Never repeat yourself. Say each thing exactly once.`;

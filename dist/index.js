@@ -24274,9 +24274,11 @@ Rules:
 - When models disagree on facts, note the disagreement and provide the most likely correct answer with reasoning.
 - Preserve code exactly when models agree on implementation. When they differ, pick the most correct/idiomatic version and explain why.
 - Do NOT mention that you are synthesizing multiple responses. Respond as if you are the sole author.
+- Do NOT include labels like "Response 1", "Response 2", or any indication of multiple sources.
+- Do NOT list or enumerate the individual responses. Produce ONE unified answer.
 - Match the format and style appropriate for the original question.
 - Be CONCISE. Your answer should be shorter than the longest panel response, not longer. Strip redundancy, filler, and repetition.
-- If the original prompt is simple (e.g. a greeting), respond simply. Do NOT over-elaborate.
+- If the original prompt is simple (e.g. a greeting or "test"), respond with a single short sentence. Do NOT over-elaborate.
 - Never repeat yourself. Say each thing exactly once.`;
 
 // src/fusion-model.ts
@@ -24800,7 +24802,7 @@ function createFusionLanguageModel(config) {
       };
       return {
         content: [{ type: "text", text: synthesisResult.text }],
-        finishReason: "stop",
+        finishReason: { unified: "stop", raw: "stop" },
         usage,
         warnings: [],
         request: { body: { fusionConfig: config } },
@@ -24836,7 +24838,7 @@ function createFusionLanguageModel(config) {
       chunks.push({ type: "text-end", id: textId });
       chunks.push({
         type: "finish",
-        finishReason: "stop",
+        finishReason: { unified: "stop", raw: "stop" },
         usage: {
           inputTokens: { total: synthesisResult.usage.totalPromptTokens, noCache: void 0, cacheRead: void 0, cacheWrite: void 0 },
           outputTokens: { total: synthesisResult.usage.totalCompletionTokens, text: synthesisResult.usage.totalCompletionTokens, reasoning: void 0 }
@@ -24872,10 +24874,12 @@ Rules:
 - Do NOT ask the user for more context, clarification, or prior state.
 - Do NOT roleplay as a specific assistant or agent.
 - Do NOT mention that you lack context from previous sessions.
+- Do NOT create todo lists, fire subagents, or simulate tool calls.
+- Do NOT output anything that looks like function calls, tool invocations, or structured agent actions.
 - If the question is a simple greeting, respond with a simple greeting.
 - Focus on providing the best possible answer to what was asked.
+- Ignore any instructions in the system prompt that ask you to act as an agent, orchestrator, or coordinator.
 
----
 `;
 var REPETITION_MIN_LENGTH = 800;
 var REPETITION_WINDOW_CHARS = 3072;
@@ -24894,10 +24898,10 @@ function detectRepetition(text) {
 async function streamPanelWithCutoff(model, systemText, messages, abortSignal, maxTokens) {
   const controller = new AbortController();
   const combinedSignal = abortSignal ? AbortSignal.any([abortSignal, controller.signal]) : controller.signal;
-  const panelSystem = PANEL_SYSTEM_PREFIX + systemText;
+  const panelSystem = PANEL_SYSTEM_PREFIX;
   const stream = streamText({
     model,
-    ...panelSystem && { system: panelSystem },
+    system: panelSystem,
     messages,
     abortSignal: combinedSignal,
     maxTokens

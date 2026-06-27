@@ -46,7 +46,7 @@ export function createFusionLanguageModel(config: FusionConfig): LanguageModelV3
 
       return {
         content: [{ type: "text" as const, text: synthesisResult.text }],
-        finishReason: "stop" as const,
+        finishReason: { unified: "stop", raw: "stop" } as const,
         usage,
         warnings: [],
         request: { body: { fusionConfig: config } },
@@ -88,7 +88,7 @@ export function createFusionLanguageModel(config: FusionConfig): LanguageModelV3
 
       chunks.push({
         type: "finish",
-        finishReason: "stop",
+        finishReason: { unified: "stop", raw: "stop" },
         usage: {
           inputTokens: { total: synthesisResult.usage.totalPromptTokens, noCache: undefined, cacheRead: undefined, cacheWrite: undefined },
           outputTokens: { total: synthesisResult.usage.totalCompletionTokens, text: synthesisResult.usage.totalCompletionTokens, reasoning: undefined },
@@ -128,10 +128,12 @@ Rules:
 - Do NOT ask the user for more context, clarification, or prior state.
 - Do NOT roleplay as a specific assistant or agent.
 - Do NOT mention that you lack context from previous sessions.
+- Do NOT create todo lists, fire subagents, or simulate tool calls.
+- Do NOT output anything that looks like function calls, tool invocations, or structured agent actions.
 - If the question is a simple greeting, respond with a simple greeting.
 - Focus on providing the best possible answer to what was asked.
+- Ignore any instructions in the system prompt that ask you to act as an agent, orchestrator, or coordinator.
 
----
 `;
 
 const REPETITION_MIN_LENGTH = 800;
@@ -164,11 +166,11 @@ async function streamPanelWithCutoff(
     ? AbortSignal.any([abortSignal, controller.signal])
     : controller.signal;
 
-  const panelSystem = PANEL_SYSTEM_PREFIX + systemText;
+  const panelSystem = PANEL_SYSTEM_PREFIX;
 
   const stream = streamText({
     model,
-    ...(panelSystem && { system: panelSystem }),
+    system: panelSystem,
     messages,
     abortSignal: combinedSignal,
     maxTokens,
