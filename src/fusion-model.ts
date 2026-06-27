@@ -6,8 +6,9 @@ import type {
 import { generateText, streamText } from "ai";
 import type { FusionConfig, PanelModel, JudgeModel, SynthesisStrategy } from "./config.js";
 import { DEFAULT_JUDGE_SYSTEM_PROMPT } from "./config.js";
-import { createProviderModel } from "./providers.js";
+import { createProviderModel, resolveModelConfig } from "./providers.js";
 import { routePanels, getRoutingSummary, type PanelAssignment, type PanelContextMode } from "./panel-router.js";
+import { isInternalProvider, queryViaSDK } from "./sdk-panel.js";
 import type { MultimodalMessage, ContentPart } from "./types.js";
 
 export interface FusionUsage {
@@ -237,8 +238,8 @@ async function queryPanel(
   const timeoutMessage = `Fusion panel timeout after ${timeout}ms`;
 
   const panelPromises = activeAssignments.map(async (assignment): Promise<PanelResponse> => {
-    const model = createProviderModel(assignment.panelModel);
     const promptMessages = assignment.messages;
+    const resolved = resolveModelConfig(assignment.panelModel);
 
     try {
       const systemTextParts: string[] = [];
@@ -257,6 +258,28 @@ async function queryPanel(
       }
       const systemText = systemTextParts.join("\n");
 
+      if (isInternalProvider(resolved.provider)) {
+        const userText = aiMessages
+          .map((m) => typeof m.content === "string" ? m.content : JSON.stringify(m.content))
+          .join("\n\n");
+
+        const result = await queryViaSDK(
+          resolved.provider,
+          resolved.model,
+          PANEL_SYSTEM_PREFIX + systemText,
+          userText,
+        );
+
+        return {
+          model: getModelLabel(assignment.panelModel),
+          text: result.text,
+          usage: result.usage,
+          finishReason: result.finishReason,
+          contextMode: assignment.mode,
+        };
+      }
+
+      const model = createProviderModel(assignment.panelModel);
       const result = await streamPanelWithCutoff(
         model,
         systemText,
@@ -362,7 +385,6 @@ async function singleJudge(
   config: FusionConfig,
   panelResponses: PanelResponse[]
 ): Promise<{ text: string; usage: FusionUsage }> {
-  const judgeModel = createProviderModel(config.judge);
   const baseSystemPrompt = config.judgeSystemPrompt ?? DEFAULT_JUDGE_SYSTEM_PROMPT;
   const coverageNote = buildContextCoverageNote(panelResponses);
   const systemPrompt = baseSystemPrompt + coverageNote;
@@ -371,12 +393,35 @@ async function singleJudge(
     .map((r, i) => `--- Response ${i + 1} (${r.model}) ---\n${r.text}`)
     .join("\n\n");
 
-  const result = await generateText({
-    model: judgeModel,
-    system: systemPrompt,
-    prompt: `Here are ${panelResponses.length} responses to synthesize:\n\n${responsesBlock}`,
-    maxTokens: 16384,
-  });
+  const userPrompt = `Here are ${panelResponses.length} responses to synthesize:\n\n${responsesBlock}`;
+
+  const judgeResolved = resolveModelConfig(config.judge);
+  let judgeText: string;
+  let judgeInputTokens = 0;
+  let judgeOutputTokens = 0;
+
+  if (isInternalProvider(judgeResolved.provider)) {
+    const result = await queryViaSDK(
+      judgeResolved.provider,
+      judgeResolved.model,
+      systemPrompt,
+      userPrompt,
+    );
+    judgeText = result.text;
+    judgeInputTokens = result.usage.promptTokens;
+    judgeOutputTokens = result.usage.completionTokens;
+  } else {
+    const judgeModel = createProviderModel(config.judge);
+    const result = await generateText({
+      model: judgeModel,
+      system: systemPrompt,
+      prompt: userPrompt,
+      maxTokens: 16384,
+    });
+    judgeText = result.text;
+    judgeInputTokens = result.usage.inputTokens ?? 0;
+    judgeOutputTokens = result.usage.outputTokens ?? 0;
+  }
 
   const panelTokens = panelResponses.map((r) => ({
     model: r.model,
@@ -384,12 +429,12 @@ async function singleJudge(
   }));
 
   const judgeTokens = {
-    promptTokens: result.usage.inputTokens ?? 0,
-    completionTokens: result.usage.outputTokens ?? 0,
+    promptTokens: judgeInputTokens,
+    completionTokens: judgeOutputTokens,
   };
 
   return {
-    text: result.text,
+    text: judgeText,
     usage: {
       panelTokens,
       judgeTokens,

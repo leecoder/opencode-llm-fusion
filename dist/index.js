@@ -24239,7 +24239,7 @@ var ContextLimitsSchema = z.object({
   default: z.number().default(128e3).describe("Default context limit for panels without explicit maxContext"),
   skipThreshold: z.number().default(256e3).describe("Input token count above which short-context panels are skipped entirely")
 });
-var FusionConfigSchema = z.object({
+var FusionModelConfigSchema = z.object({
   panel: z.array(PanelModelSchema).min(2),
   judge: JudgeModelSchema,
   strategy: SynthesisStrategySchema.default("single_judge"),
@@ -24248,6 +24248,19 @@ var FusionConfigSchema = z.object({
   judgeSystemPrompt: z.string().optional(),
   contextLimits: ContextLimitsSchema.default({})
 });
+var FusionConfigSchema = z.union([
+  FusionModelConfigSchema,
+  z.object({
+    models: z.record(z.string(), FusionModelConfigSchema),
+    defaults: z.object({
+      strategy: SynthesisStrategySchema.default("single_judge"),
+      routing: RoutingPolicySchema.default({}),
+      timeout: z.number().default(12e4),
+      judgeSystemPrompt: z.string().optional(),
+      contextLimits: ContextLimitsSchema.default({})
+    }).default({})
+  })
+]);
 var DEFAULT_JUDGE_SYSTEM_PROMPT = `You are a synthesis judge. You receive multiple responses to the same prompt from different AI models.
 
 Your task:
@@ -24678,6 +24691,98 @@ function getRoutingSummary(assignments) {
   return lines.join("\n");
 }
 
+// src/sdk-panel.ts
+var INTERNAL_PROVIDERS = /* @__PURE__ */ new Set(["kiro", "github-copilot"]);
+function isInternalProvider(providerID) {
+  return INTERNAL_PROVIDERS.has(providerID);
+}
+function getServerConfig() {
+  const pid = process.env.OPENCODE_PID;
+  const port = process.env.OPENCODE_SERVER_PORT;
+  const username = process.env.OPENCODE_SERVER_USERNAME ?? "opencode";
+  const password = process.env.OPENCODE_SERVER_PASSWORD ?? "";
+  let serverUrl = process.env.OPENCODE_SERVER_URL ?? "";
+  if (!serverUrl && port) {
+    serverUrl = `http://127.0.0.1:${port}`;
+  }
+  if (!serverUrl) {
+    const lsof = __require("child_process");
+    try {
+      if (pid) {
+        const result = lsof.execSync(`lsof -iTCP -sTCP:LISTEN -P -n -a -p ${pid} 2>/dev/null | grep LISTEN | head -1`, { encoding: "utf-8" });
+        const match = result.match(/:(\d+)\s/);
+        if (match) {
+          serverUrl = `http://127.0.0.1:${match[1]}`;
+        }
+      }
+    } catch {
+    }
+  }
+  if (!serverUrl) {
+    serverUrl = "http://127.0.0.1:60888";
+  }
+  const auth = Buffer.from(`${username}:${password}`).toString("base64");
+  return { url: serverUrl, auth };
+}
+async function queryViaSDK(providerID, modelID, systemText, userText, parentSessionID) {
+  const { url: serverUrl, auth } = getServerConfig();
+  const directory = process.cwd();
+  const headers = {
+    "Content-Type": "application/json",
+    "Authorization": `Basic ${auth}`
+  };
+  const createRes = await fetch(`${serverUrl}/session?directory=${encodeURIComponent(directory)}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({
+      ...parentSessionID && { parentID: parentSessionID },
+      title: `[fusion-panel] ${providerID}/${modelID}`,
+      model: { id: modelID, providerID }
+    })
+  });
+  if (!createRes.ok) {
+    const errText = await createRes.text().catch(() => "");
+    if (createRes.status === 401) {
+      throw new Error(`[fusion] Cannot access OpenCode runtime for ${providerID}/${modelID}. Internal providers (kiro, github-copilot) only work inside OpenCode app sessions, not via "opencode run".`);
+    }
+    throw new Error(`SDK session.create failed (${createRes.status}): ${errText}`);
+  }
+  const session = await createRes.json();
+  const sessionID = session.id;
+  try {
+    const parts = [{ type: "text", text: userText }];
+    const promptRes = await fetch(`${serverUrl}/session/${sessionID}/message?directory=${encodeURIComponent(directory)}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: { providerID, modelID },
+        ...systemText && { system: systemText },
+        parts,
+        tools: {},
+        noReply: false
+      })
+    });
+    if (!promptRes.ok) {
+      const errText = await promptRes.text().catch(() => "");
+      throw new Error(`SDK session.prompt failed (${promptRes.status}): ${errText}`);
+    }
+    const result = await promptRes.json();
+    const textParts = (result.parts ?? []).filter((p) => p.type === "text" && p.text).map((p) => p.text);
+    const text = textParts.join("\n");
+    return {
+      text: text || "[No response from model]",
+      usage: { promptTokens: 0, completionTokens: 0 },
+      finishReason: "stop"
+    };
+  } finally {
+    fetch(`${serverUrl}/session/${sessionID}`, {
+      method: "DELETE",
+      headers
+    }).catch(() => {
+    });
+  }
+}
+
 // src/fusion-model.ts
 function createFusionLanguageModel(config) {
   const modelId = `fusion-${config.panel.length}-panel`;
@@ -24846,8 +24951,8 @@ async function queryPanel(config, options) {
   const panelAbortSignal = options.abortSignal ? AbortSignal.any([options.abortSignal, timeoutController.signal]) : timeoutController.signal;
   const timeoutMessage = `Fusion panel timeout after ${timeout}ms`;
   const panelPromises = activeAssignments.map(async (assignment) => {
-    const model = createProviderModel(assignment.panelModel);
     const promptMessages = assignment.messages;
+    const resolved = resolveModelConfig(assignment.panelModel);
     try {
       const systemTextParts = [];
       const aiMessages = [];
@@ -24864,6 +24969,23 @@ async function queryPanel(config, options) {
         });
       }
       const systemText = systemTextParts.join("\n");
+      if (isInternalProvider(resolved.provider)) {
+        const userText = aiMessages.map((m) => typeof m.content === "string" ? m.content : JSON.stringify(m.content)).join("\n\n");
+        const result2 = await queryViaSDK(
+          resolved.provider,
+          resolved.model,
+          PANEL_SYSTEM_PREFIX + systemText,
+          userText
+        );
+        return {
+          model: getModelLabel(assignment.panelModel),
+          text: result2.text,
+          usage: result2.usage,
+          finishReason: result2.finishReason,
+          contextMode: assignment.mode
+        };
+      }
+      const model = createProviderModel(assignment.panelModel);
       const result = await streamPanelWithCutoff(
         model,
         systemText,
@@ -24891,16 +25013,20 @@ async function queryPanel(config, options) {
       };
     }
   });
-  const timeoutPromise = new Promise(
-    (_, reject) => setTimeout(() => {
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(() => {
       timeoutController.abort();
       reject(new Error(timeoutMessage));
-    }, timeout)
-  );
+    }, timeout);
+  });
   let results;
   try {
     results = await Promise.race([Promise.all(panelPromises), timeoutPromise]);
   } finally {
+    if (timeoutId !== void 0) {
+      clearTimeout(timeoutId);
+    }
     timeoutController.abort();
   }
   return results.filter((r) => r.finishReason !== "error" || results.length <= 2);
@@ -24948,30 +25074,50 @@ function buildContextCoverageNote(panelResponses) {
   return lines.join("\n");
 }
 async function singleJudge(config, panelResponses) {
-  const judgeModel = createProviderModel(config.judge);
   const baseSystemPrompt = config.judgeSystemPrompt ?? DEFAULT_JUDGE_SYSTEM_PROMPT;
   const coverageNote = buildContextCoverageNote(panelResponses);
   const systemPrompt = baseSystemPrompt + coverageNote;
   const responsesBlock = panelResponses.map((r, i) => `--- Response ${i + 1} (${r.model}) ---
 ${r.text}`).join("\n\n");
-  const result = await generateText({
-    model: judgeModel,
-    system: systemPrompt,
-    prompt: `Here are ${panelResponses.length} responses to synthesize:
+  const userPrompt = `Here are ${panelResponses.length} responses to synthesize:
 
-${responsesBlock}`,
-    maxTokens: 16384
-  });
+${responsesBlock}`;
+  const judgeResolved = resolveModelConfig(config.judge);
+  let judgeText;
+  let judgeInputTokens = 0;
+  let judgeOutputTokens = 0;
+  if (isInternalProvider(judgeResolved.provider)) {
+    const result = await queryViaSDK(
+      judgeResolved.provider,
+      judgeResolved.model,
+      systemPrompt,
+      userPrompt
+    );
+    judgeText = result.text;
+    judgeInputTokens = result.usage.promptTokens;
+    judgeOutputTokens = result.usage.completionTokens;
+  } else {
+    const judgeModel = createProviderModel(config.judge);
+    const result = await generateText({
+      model: judgeModel,
+      system: systemPrompt,
+      prompt: userPrompt,
+      maxTokens: 16384
+    });
+    judgeText = result.text;
+    judgeInputTokens = result.usage.inputTokens ?? 0;
+    judgeOutputTokens = result.usage.outputTokens ?? 0;
+  }
   const panelTokens = panelResponses.map((r) => ({
     model: r.model,
     ...r.usage
   }));
   const judgeTokens = {
-    promptTokens: result.usage.inputTokens ?? 0,
-    completionTokens: result.usage.outputTokens ?? 0
+    promptTokens: judgeInputTokens,
+    completionTokens: judgeOutputTokens
   };
   return {
-    text: result.text,
+    text: judgeText,
     usage: {
       panelTokens,
       judgeTokens,
@@ -25197,7 +25343,15 @@ function loadConfig() {
         const raw = fs.readFileSync(candidate, "utf-8");
         const cleaned = candidate.endsWith(".jsonc") ? raw.replace(/(?<![:"\\])\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "") : raw;
         const parsed = JSON.parse(cleaned);
-        return FusionConfigSchema.parse(parsed);
+        if (parsed.models && typeof parsed.models === "object" && !Array.isArray(parsed.models)) {
+          const defaults = parsed.defaults ?? {};
+          const models = {};
+          for (const [id, modelConf] of Object.entries(parsed.models)) {
+            models[id] = FusionModelConfigSchema.parse({ ...defaults, ...modelConf });
+          }
+          return { type: "multi", multi: { models, defaults } };
+        }
+        return { type: "single", single: FusionModelConfigSchema.parse(parsed) };
       }
     } catch {
       continue;
@@ -25205,18 +25359,36 @@ function loadConfig() {
   }
   return null;
 }
+function resolveConfigForModel(loaded, modelId) {
+  if (loaded.type === "single" && loaded.single) {
+    return loaded.single;
+  }
+  if (loaded.type === "multi" && loaded.multi) {
+    const modelConfig = loaded.multi.models[modelId];
+    if (modelConfig) return modelConfig;
+    const firstKey = Object.keys(loaded.multi.models)[0];
+    if (firstKey) return loaded.multi.models[firstKey];
+  }
+  throw new Error(`[opencode-llm-fusion] No config found for model "${modelId}"`);
+}
 function createFusion(_options) {
-  const config = loadConfig();
-  if (!config) {
+  const loaded = loadConfig();
+  if (!loaded) {
     throw new Error(
       "[opencode-llm-fusion] No configuration found. Create .opencode/opencode-llm-fusion.json or ~/.config/opencode/opencode-llm-fusion.json"
     );
   }
-  const judgeLabel = typeof config.judge === "string" ? config.judge : `${config.judge.provider}/${config.judge.model}`;
-  console.log(
-    `[opencode-llm-fusion] Loaded: ${config.panel.length} panel models, judge=${judgeLabel}, strategy=${config.strategy}`
-  );
+  if (loaded.type === "multi" && loaded.multi) {
+    const modelNames = Object.keys(loaded.multi.models).join(", ");
+    console.log(`[opencode-llm-fusion] Loaded multi-model config: ${modelNames}`);
+  } else if (loaded.single) {
+    const judgeLabel = typeof loaded.single.judge === "string" ? loaded.single.judge : `${loaded.single.provider}/${loaded.single.model}`;
+    console.log(
+      `[opencode-llm-fusion] Loaded: ${loaded.single.panel.length} panel models, judge=${judgeLabel}, strategy=${loaded.single.strategy}`
+    );
+  }
   const provider = (modelId) => {
+    const config = resolveConfigForModel(loaded, modelId);
     let effectiveConfig = config;
     if (modelId.includes("majority_vote")) {
       effectiveConfig = { ...config, strategy: "majority_vote" };
@@ -25234,12 +25406,15 @@ function createFusion(_options) {
 export {
   DEFAULT_JUDGE_SYSTEM_PROMPT,
   FusionConfigSchema,
+  FusionModelConfigSchema,
   createFusion,
   createFusionLanguageModel,
   estimatePromptTokens,
   getRoutingSummary,
   hasImages,
+  isInternalProvider,
   packContext,
+  queryViaSDK,
   routePanels,
   shouldUseFusion
 };

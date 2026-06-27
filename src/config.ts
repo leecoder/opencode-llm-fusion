@@ -49,7 +49,7 @@ export const ContextLimitsSchema = z.object({
 
 export type ContextLimits = z.infer<typeof ContextLimitsSchema>;
 
-export const FusionConfigSchema = z.object({
+export const FusionModelConfigSchema = z.object({
   panel: z.array(PanelModelSchema).min(2),
   judge: JudgeModelSchema,
   strategy: SynthesisStrategySchema.default("single_judge"),
@@ -59,7 +59,24 @@ export const FusionConfigSchema = z.object({
   contextLimits: ContextLimitsSchema.default({}),
 });
 
-export type FusionConfig = z.infer<typeof FusionConfigSchema>;
+export type FusionModelConfig = z.infer<typeof FusionModelConfigSchema>;
+
+export const FusionConfigSchema = z.union([
+  FusionModelConfigSchema,
+  z.object({
+    models: z.record(z.string(), FusionModelConfigSchema),
+    defaults: z.object({
+      strategy: SynthesisStrategySchema.default("single_judge"),
+      routing: RoutingPolicySchema.default({}),
+      timeout: z.number().default(120000),
+      judgeSystemPrompt: z.string().optional(),
+      contextLimits: ContextLimitsSchema.default({}),
+    }).default({}),
+  }),
+]);
+
+export type FusionConfig = z.infer<typeof FusionModelConfigSchema>;
+export type FusionMultiConfig = { models: Record<string, FusionModelConfig>; defaults: Partial<FusionModelConfig> };
 
 export const DEFAULT_JUDGE_SYSTEM_PROMPT = `You are a synthesis judge. You receive multiple responses to the same prompt from different AI models.
 

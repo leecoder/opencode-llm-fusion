@@ -1,18 +1,25 @@
-import type { FusionConfig } from "./config.js";
-import { FusionConfigSchema } from "./config.js";
+import type { FusionConfig, FusionMultiConfig } from "./config.js";
+import { FusionConfigSchema, FusionModelConfigSchema } from "./config.js";
 import { createFusionLanguageModel } from "./fusion-model.js";
 import { shouldUseFusion } from "./routing.js";
 
-export type { FusionConfig, SynthesisStrategy, PanelModel, JudgeModel, ContextLimits } from "./config.js";
-export { FusionConfigSchema, DEFAULT_JUDGE_SYSTEM_PROMPT } from "./config.js";
+export type { FusionConfig, FusionMultiConfig, SynthesisStrategy, PanelModel, JudgeModel, ContextLimits } from "./config.js";
+export { FusionConfigSchema, FusionModelConfigSchema, DEFAULT_JUDGE_SYSTEM_PROMPT } from "./config.js";
 export { createFusionLanguageModel } from "./fusion-model.js";
 export { shouldUseFusion } from "./routing.js";
 export { packContext, estimatePromptTokens } from "./context-packer.js";
 export { routePanels, getRoutingSummary, hasImages } from "./panel-router.js";
 export type { PanelContextMode, PanelAssignment } from "./panel-router.js";
 export type { MultimodalMessage, ContentPart } from "./types.js";
+export { isInternalProvider, queryViaSDK } from "./sdk-panel.js";
 
-function loadConfig(): FusionConfig | null {
+interface LoadedConfig {
+  type: "single" | "multi";
+  single?: FusionConfig;
+  multi?: FusionMultiConfig;
+}
+
+function loadConfig(): LoadedConfig | null {
   const fs = require("fs");
   const path = require("path");
 
@@ -31,7 +38,17 @@ function loadConfig(): FusionConfig | null {
           ? raw.replace(/(?<![:"\\])\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "")
           : raw;
         const parsed = JSON.parse(cleaned);
-        return FusionConfigSchema.parse(parsed);
+
+        if (parsed.models && typeof parsed.models === "object" && !Array.isArray(parsed.models)) {
+          const defaults = parsed.defaults ?? {};
+          const models: Record<string, FusionConfig> = {};
+          for (const [id, modelConf] of Object.entries(parsed.models)) {
+            models[id] = FusionModelConfigSchema.parse({ ...defaults, ...(modelConf as any) });
+          }
+          return { type: "multi", multi: { models, defaults } };
+        }
+
+        return { type: "single", single: FusionModelConfigSchema.parse(parsed) };
       }
     } catch {
       continue;
@@ -41,21 +58,44 @@ function loadConfig(): FusionConfig | null {
   return null;
 }
 
-export function createFusion(_options?: Record<string, any>) {
-  const config = loadConfig();
+function resolveConfigForModel(loaded: LoadedConfig, modelId: string): FusionConfig {
+  if (loaded.type === "single" && loaded.single) {
+    return loaded.single;
+  }
 
-  if (!config) {
+  if (loaded.type === "multi" && loaded.multi) {
+    const modelConfig = loaded.multi.models[modelId];
+    if (modelConfig) return modelConfig;
+
+    const firstKey = Object.keys(loaded.multi.models)[0];
+    if (firstKey) return loaded.multi.models[firstKey]!;
+  }
+
+  throw new Error(`[opencode-llm-fusion] No config found for model "${modelId}"`);
+}
+
+export function createFusion(_options?: Record<string, any>) {
+  const loaded = loadConfig();
+
+  if (!loaded) {
     throw new Error(
       "[opencode-llm-fusion] No configuration found. Create .opencode/opencode-llm-fusion.json or ~/.config/opencode/opencode-llm-fusion.json"
     );
   }
 
-  const judgeLabel = typeof config.judge === "string" ? config.judge : `${config.judge.provider}/${config.judge.model}`;
-  console.log(
-    `[opencode-llm-fusion] Loaded: ${config.panel.length} panel models, judge=${judgeLabel}, strategy=${config.strategy}`
-  );
+  if (loaded.type === "multi" && loaded.multi) {
+    const modelNames = Object.keys(loaded.multi.models).join(", ");
+    console.log(`[opencode-llm-fusion] Loaded multi-model config: ${modelNames}`);
+  } else if (loaded.single) {
+    const judgeLabel = typeof loaded.single.judge === "string" ? loaded.single.judge : `${loaded.single.provider}/${loaded.single.model}`;
+    console.log(
+      `[opencode-llm-fusion] Loaded: ${loaded.single.panel.length} panel models, judge=${judgeLabel}, strategy=${loaded.single.strategy}`
+    );
+  }
 
   const provider = (modelId: string) => {
+    const config = resolveConfigForModel(loaded, modelId);
+
     let effectiveConfig = config;
     if (modelId.includes("majority_vote")) {
       effectiveConfig = { ...config, strategy: "majority_vote" as const };
